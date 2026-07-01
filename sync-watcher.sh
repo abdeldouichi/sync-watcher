@@ -29,6 +29,10 @@
 #  * Dependency pre-flight check                       -> clear early failure.
 #  * Config files auto-created & validated            -> self-healing setup.
 #  * rsync runs ONLY after a real inotify event        -> no wasted syncs.
+#  * .syncignore (gitignore-style) exclusions          -> applied uniformly to
+#                                                         initial sync, every
+#                                                         incremental sync, and
+#                                                         the watcher itself.
 # ------------------------------------------------------------------------- #
 
 set -euo pipefail
@@ -71,6 +75,30 @@ readonly RSYNC_OPTS=(-a --delete -h --partial)
 
 # Required external commands.
 readonly REQUIRED_COMMANDS=(rsync inotifywait flock)
+
+# --------------------------------------------------------------------------- #
+# .syncignore configuration
+# --------------------------------------------------------------------------- #
+# User-editable ignore file, gitignore-style. Optional: if absent, nothing is
+# excluded and behavior is identical to previous versions (backward compatible).
+readonly SYNCIGNORE_FILE="${BASE_DIR}/.syncignore"
+
+# Generated, rsync-native filter file translated from SYNCIGNORE_FILE. It lives
+# in a private runtime location and is regenerated on every startup so it can
+# never drift from the user's .syncignore. Cleaned up by the EXIT trap.
+# Declared and assigned separately so mktemp's exit status is not masked.
+RSYNC_RULES_FILE=""
+RSYNC_RULES_FILE="$(mktemp -t "${PROCESS_NAME}.rules.XXXXXX")"
+readonly RSYNC_RULES_FILE
+
+# Root-anchored directory names (leading-slash patterns like "/node_modules")
+# are additionally pruned from the inotify watch tree via @<path>, which — unlike
+# a regex exclude — prevents an inotify watch from being allocated at all. This
+# is the only mechanism that reduces the kernel watch count and avoids hitting
+# fs.inotify.max_user_watches on trees with huge dirs (node_modules, target…).
+INOTIFY_PRUNE_DIRS=()   # populated from .syncignore (root-anchored dir patterns)
+INOTIFY_EXCLUDE_REGEX=""  # POSIX ERE built from .syncignore for --exclude
+SYNCIGNORE_ACTIVE=false   # true once at least one rule is loaded
 
 # --------------------------------------------------------------------------- #
 # Runtime globals (populated after validation)
@@ -119,6 +147,9 @@ cleanup() {
     # Best-effort removal of the lock file. Harmless if another guarded run
     # recreated it; flock semantics do not depend on the file's existence.
     rm -f "$LOCK_FILE" 2>/dev/null || true
+
+    # Remove the generated rsync rules file (temporary resource).
+    rm -f "$RSYNC_RULES_FILE" 2>/dev/null || true
 
     log_info "Exiting (status ${exit_code})."
     exit "$exit_code"
@@ -287,6 +318,148 @@ assert_distinct_paths() {
 }
 
 # --------------------------------------------------------------------------- #
+# .syncignore parsing and translation
+# --------------------------------------------------------------------------- #
+# The user writes gitignore-style rules in $HOME/.syncignore. We translate them
+# into two consistent representations so ALL sync operations honor them:
+#
+#   1. RSYNC_RULES_FILE  -> consumed by `rsync --exclude-from`. Handles the
+#      actual file transfer (initial + every incremental sync). rsync's own C
+#      filter engine matches efficiently and, crucially, PRUNES excluded
+#      directories from its scan (no descent) when we emit `/dir/***`.
+#
+#   2. INOTIFY_EXCLUDE_REGEX + INOTIFY_PRUNE_DIRS -> consumed by inotifywait so
+#      the watcher does not wake up (and trigger a needless sync) for events on
+#      ignored files, and does not even allocate watches for large ignored dirs.
+#
+# Both are derived from the SAME source file, guaranteeing consistent behavior.
+#
+# NOTE ON SEMANTICS: We implement a pragmatic subset of gitignore. rsync uses
+# "first match wins" whereas git uses "last match wins", so negation (`!`) rules
+# are emitted BEFORE their excludes (two-pass) to approximate the intent.
+# See the README "Known limitations" section for details.
+
+# Escape a literal string for safe inclusion in a POSIX extended regex (ERE).
+# Escapes ERE metacharacters that may legitimately appear in path literals.
+# Glob wildcards (* ? **) are NOT touched here; the caller substitutes them.
+escape_for_ere() {
+    # Bracket class ordering matters: a literal ] must appear first, and the
+    # escaped backslash \\ must appear last, to keep the class well-formed.
+    printf '%s' "$1" | sed -E 's/[][(){}.^$*+?|\\]/\\&/g'
+}
+
+# Convert a single gitignore-style glob into a POSIX ERE fragment for
+# inotifywait --exclude. inotifywait matches the regex against the FULL path,
+# so unanchored patterns get a leading ".*/" and every fragment ends with
+# "(/.*)?" so a directory pattern also matches everything beneath it.
+glob_to_ere() {
+    local glob="$1"
+    local anchored=false
+    if [[ "$glob" == /* ]]; then
+        anchored=true
+        glob="${glob#/}"
+    fi
+    glob="${glob%/}"   # drop any trailing slash (directory marker)
+
+    # Protect glob wildcards with unlikely text placeholders, escape the rest
+    # as literals, then substitute the ERE equivalents back in.
+    glob="${glob//\*\*/@@DBLSTAR@@}"     # ** -> placeholder
+    glob="${glob//\*/@@STAR@@}"          # *  -> placeholder
+    glob="${glob//\?/@@QMARK@@}"         # ?  -> placeholder
+    glob="$(escape_for_ere "$glob")"
+    glob="${glob//@@DBLSTAR@@/.*}"       # ** -> .*    (crosses slashes)
+    glob="${glob//@@STAR@@/[^/]*}"       # *  -> [^/]* (within one component)
+    glob="${glob//@@QMARK@@/[^/]}"       # ?  -> single non-slash char
+
+    if [[ "$anchored" == true ]]; then
+        printf '%s' "$(escape_for_ere "$SOURCE_PATH")/${glob}(/.*)?"
+    else
+        printf '%s' ".*/${glob}(/.*)?"
+    fi
+}
+
+# Parse $HOME/.syncignore and populate RSYNC_RULES_FILE, INOTIFY_EXCLUDE_REGEX,
+# and INOTIFY_PRUNE_DIRS. Backward compatible: a missing or empty file leaves
+# the rules file empty and SYNCIGNORE_ACTIVE false (syncs everything).
+load_syncignore() {
+    : > "$RSYNC_RULES_FILE"   # always start from a clean, empty rules file
+
+    if [[ ! -f "$SYNCIGNORE_FILE" ]]; then
+        log_info "No .syncignore found at ${SYNCIGNORE_FILE}; syncing everything."
+        return 0
+    fi
+
+    log_info "Loading ignore rules from ${SYNCIGNORE_FILE}"
+
+    local -a include_rules=()   # negation (!) -> rsync '+ ' (emitted first)
+    local -a exclude_rules=()   # normal      -> rsync '- '
+    local -a ere_parts=()       # regex fragments for inotifywait
+    local line raw pattern is_negated
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        raw="${line%$'\r'}"                    # strip trailing CR (CRLF files)
+        # Skip full-line comments (leading #, optionally indented).
+        [[ "$raw" =~ ^[[:space:]]*# ]] && continue
+        # Trim surrounding whitespace.
+        raw="${raw#"${raw%%[![:space:]]*}"}"
+        raw="${raw%"${raw##*[![:space:]]}"}"
+        [[ -z "$raw" ]] && continue            # skip blank lines
+
+        is_negated=false
+        if [[ "$raw" == '!'* ]]; then
+            is_negated=true
+            raw="${raw#!}"
+        fi
+        pattern="$raw"
+
+        if [[ "$is_negated" == true ]]; then
+            include_rules+=("+ ${pattern}")
+            continue   # negated patterns are never pruned from the watch tree
+        fi
+
+        # Root-anchored directory-style pattern without wildcards
+        # (e.g. /node_modules, /target, /.git): emit the triple-star form so
+        # rsync excludes the dir AND skips descending into it, and register the
+        # directory for inotify @<path> pruning (no watch allocated at all).
+        if [[ "$pattern" == /* && "$pattern" != *'*'* ]]; then
+            local bare="${pattern#/}"; bare="${bare%/}"
+            if [[ -d "${SOURCE_PATH}/${bare}" ]]; then
+                exclude_rules+=("- /${bare}/***")
+                INOTIFY_PRUNE_DIRS+=("@${SOURCE_PATH}/${bare}")
+            else
+                exclude_rules+=("- ${pattern}")   # file or not-yet-created dir
+            fi
+        else
+            exclude_rules+=("- ${pattern}")
+        fi
+
+        ere_parts+=("$(glob_to_ere "$pattern")")
+    done < "$SYNCIGNORE_FILE"
+
+    # Two-pass emit: negations (includes) FIRST so rsync's first-match-wins
+    # lets them override the excludes that follow.
+    local rule
+    {
+        printf '%s\n' "# Generated by ${PROCESS_NAME} from ${SYNCIGNORE_FILE}"
+        for rule in "${include_rules[@]:-}"; do [[ -n "$rule" ]] && printf '%s\n' "$rule"; done
+        for rule in "${exclude_rules[@]:-}"; do [[ -n "$rule" ]] && printf '%s\n' "$rule"; done
+    } > "$RSYNC_RULES_FILE"
+
+    # Join regex fragments into one alternation for inotifywait --exclude.
+    if (( ${#ere_parts[@]} > 0 )); then
+        local IFS='|'
+        INOTIFY_EXCLUDE_REGEX="${ere_parts[*]}"
+    fi
+
+    if (( ${#include_rules[@]} + ${#exclude_rules[@]} > 0 )); then
+        SYNCIGNORE_ACTIVE=true
+        log_info "Ignore rules active: ${#exclude_rules[@]} exclude, ${#include_rules[@]} negation, ${#INOTIFY_PRUNE_DIRS[@]} pruned dir(s)."
+    else
+        log_info ".syncignore contained no effective rules; syncing everything."
+    fi
+}
+
+# --------------------------------------------------------------------------- #
 # Synchronization
 # --------------------------------------------------------------------------- #
 # IMPORTANT one-way semantics:
@@ -300,8 +473,17 @@ run_sync() {
 
     # We deliberately do NOT let a transient rsync failure kill the daemon;
     # we log it and keep watching. `set -e` is locally suspended around rsync.
+    #
+    # Build the rsync argument list, adding --exclude-from only when the user
+    # has active .syncignore rules. This keeps the common (no-ignore) path
+    # identical to previous versions for full backward compatibility.
+    local -a rsync_args=("${RSYNC_OPTS[@]}")
+    if [[ "$SYNCIGNORE_ACTIVE" == true ]]; then
+        rsync_args+=(--exclude-from="$RSYNC_RULES_FILE")
+    fi
+
     local rc=0
-    rsync "${RSYNC_OPTS[@]}" -- "${SOURCE_PATH}/" "${TARGET_PATH}/" || rc=$?
+    rsync "${rsync_args[@]}" -- "${SOURCE_PATH}/" "${TARGET_PATH}/" || rc=$?
 
     if (( rc == 0 )); then
         log_info "Synchronization completed successfully."
@@ -323,12 +505,28 @@ start_watcher() {
     # Perform an initial sync so TARGET matches SOURCE immediately at startup.
     run_sync
 
-    # `inotifywait` blocks until an event occurs, then returns. We loop,
-    # syncing once per detected event batch. `--quiet` keeps logs clean.
-    while inotifywait --quiet --recursive \
-                      --event "$INOTIFY_EVENTS" \
-                      --format '%w%f %e' \
-                      "$SOURCE_PATH"; do
+    # Assemble the inotifywait argument list. Ignore rules are applied here so
+    # the watcher never wakes up for events on ignored paths:
+    #   * @<path> entries prune large ignored directories from the watch tree
+    #     entirely (no inotify watch allocated -> avoids the watch-count limit).
+    #   * --exclude <regex> filters out events for ignored files at any depth.
+    local -a inotify_args=(--quiet --recursive
+                           --event "$INOTIFY_EVENTS"
+                           --format '%w%f %e')
+
+    if [[ "$SYNCIGNORE_ACTIVE" == true ]]; then
+        if (( ${#INOTIFY_PRUNE_DIRS[@]} > 0 )); then
+            inotify_args+=("${INOTIFY_PRUNE_DIRS[@]}")
+            log_info "Pruning ${#INOTIFY_PRUNE_DIRS[@]} ignored director(y/ies) from the watch tree."
+        fi
+        if [[ -n "$INOTIFY_EXCLUDE_REGEX" ]]; then
+            inotify_args+=(--exclude "$INOTIFY_EXCLUDE_REGEX")
+        fi
+    fi
+
+    # `inotifywait` blocks until a (non-excluded) event occurs, then returns.
+    # We loop, syncing once per detected event batch.
+    while inotifywait "${inotify_args[@]}" "$SOURCE_PATH"; do
         run_sync
     done
 }
@@ -349,6 +547,10 @@ main() {
                     "Please enter the TARGET directory to sync into")"
 
     assert_distinct_paths "$SOURCE_PATH" "$TARGET_PATH"
+
+    # Load ignore rules AFTER the source path is known (the source path is used
+    # to anchor patterns and to detect which ignored entries are directories).
+    load_syncignore
 
     start_watcher
 }
