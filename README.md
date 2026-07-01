@@ -32,6 +32,7 @@ Watches a source directory and mirrors every change into a target directory in r
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
 - [Configuration](#configuration)
+- [Ignoring Files (`.syncignore`)](#ignoring-files-syncignore)
 - [Usage](#usage)
 - [Examples](#examples)
 - [Project Structure](#project-structure)
@@ -95,6 +96,7 @@ built specifically to avoid them:
 - ✅ **Strictly one-way** — target is an exact mirror of source; target-side edits never flow back.
 - ✅ **Single-instance execution** — `flock`-based lock prevents concurrent runs; a second launch exits gracefully with a clear message.
 - ✅ **Self-healing configuration** — config files are created automatically; invalid/missing paths trigger an interactive prompt and are saved back.
+- ✅ **`.syncignore` exclusions** — gitignore-style ignore rules, applied consistently to the initial sync, every incremental sync, **and** the file watcher; ignored directories are pruned from the watch tree for efficiency.
 - ✅ **Safe by default** — refuses to run if source and target are identical or nested, preventing destructive/recursive copies.
 - ✅ **Robust cleanup** — `trap` guarantees lock release on any exit path.
 - ✅ **Dependency pre-flight checks** — verifies `rsync`, `inotifywait`, and `flock` are installed before starting, with install hints.
@@ -209,6 +211,7 @@ directory (one path per file). They are **created automatically** on first run.
 | --------------------------------- | -------------------------------- |
 | `~/.sync-watcher.source.path`     | Absolute path of the **source**. |
 | `~/.sync-watcher.target.path`     | Absolute path of the **target**. |
+| `~/.syncignore`                   | Optional gitignore-style exclude rules — see [Ignoring Files](#ignoring-files-syncignore). |
 
 **Resolution logic for each path:**
 
@@ -234,6 +237,114 @@ These live near the top of `sync-watcher.sh` and can be edited to taste:
 | `INOTIFY_EVENTS`  | `modify,create,delete,move,attrib`        | Events that trigger a sync.                   |
 | `RSYNC_OPTS`      | `-a --delete -h --partial`                | rsync behavior (archive + mirror).            |
 | `LOCK_FILE`       | `$XDG_RUNTIME_DIR` or `$HOME`             | Location of the flock lock file.              |
+| `SYNCIGNORE_FILE` | `~/.syncignore`                           | Location of the ignore-rules file.            |
+
+---
+
+## Ignoring Files (`.syncignore`)
+
+You can exclude files and directories from synchronization with a
+**`.syncignore`** file located at:
+
+```text
+$HOME/.syncignore
+```
+
+The syntax closely follows **`.gitignore`** semantics. The file is **optional** —
+if it does not exist, everything under the source is synchronized (fully backward
+compatible).
+
+> [!IMPORTANT]
+> Ignore rules are applied **consistently everywhere**: the initial sync at
+> startup, every incremental sync, and the file watcher itself. The watcher will
+> not even wake up for events on ignored files, and large ignored directories are
+> pruned from the watch tree entirely (see [How it works](#how-it-works-internally)).
+
+### Example `.syncignore`
+
+```gitignore
+# Comments start with '#'. Blank lines are ignored.
+
+# Ignore version-control and build/dependency directories (root-anchored)
+/.git
+/target
+/node_modules
+
+# Ignore all compressed archives, at any depth
+**/*.tar.gz
+
+# Ignore all log files, anywhere
+*.log
+
+# Ignore environment files
+.env
+
+# ...but keep this one specific log (negation / re-include)
+!important.log
+```
+
+### Supported pattern syntax
+
+| Pattern            | Meaning                                                                                     | Example matches                          |
+| ------------------ | ------------------------------------------------------------------------------------------- | ---------------------------------------- |
+| `name`             | Matches a file or directory named `name` **at any depth**.                                  | `.env`, `src/.env`                       |
+| `*.ext`            | Matches any file ending in `.ext` at any depth (`*` does **not** cross `/`).                 | `a.log`, `src/b.log`                     |
+| `**/pattern`       | `**` matches across directory boundaries (any depth).                                       | `**/*.tar.gz` → `x.tar.gz`, `d/x.tar.gz` |
+| `/name`            | **Leading slash** anchors to the source root only.                                          | `/target` → top-level `target/` only     |
+| `name/`            | **Trailing slash** matches directories only.                                                | `build/`                                 |
+| `?`                | Matches exactly one non-`/` character.                                                      | `file?.txt` → `file1.txt`                |
+| `# comment`        | A line beginning with `#` is a comment.                                                     | —                                        |
+| `!pattern`         | **Negation** — re-include a path that an earlier pattern excluded.                          | `!important.log`                         |
+
+### Example use cases
+
+| Goal                                                | Rules                                        |
+| --------------------------------------------------- | -------------------------------------------- |
+| Skip Node.js dependencies                           | `/node_modules`                              |
+| Skip Rust/Java build output                         | `/target`                                    |
+| Never copy secrets                                  | `.env`<br>`*.pem`<br>`**/secrets/*`          |
+| Skip logs but keep one audit log                    | `*.log`<br>`!audit.log`                      |
+| Skip all archives regardless of location            | `**/*.tar.gz`<br>`**/*.zip`                  |
+| Skip a VCS directory and avoid watching it          | `/.git`                                      |
+
+### How it works internally
+
+On startup (after the source directory is known) sync-watcher reads
+`~/.syncignore` once and translates it into two consistent representations, both
+derived from the *same* source of truth:
+
+1. **An rsync filter file** (`--exclude-from`). rsync's own C filter engine
+   performs the matching during its directory scan, so it is fast and — for
+   root-anchored directories — it **prunes the entire subtree** (emitted as the
+   rsync `/<dir>/***` idiom), never descending into it.
+2. **An `inotifywait` filter**. Root-anchored ignored directories are excluded
+   from the watch tree via `@<path>`, which prevents an inotify watch from being
+   allocated at all — the only mechanism that actually reduces the kernel watch
+   count and helps avoid the `fs.inotify.max_user_watches` limit. A POSIX ERE
+   `--exclude` regex, built from the same patterns, filters out events for
+   ignored files at any depth so the watcher never triggers a needless sync.
+
+> [!NOTE]
+> The `.syncignore` file is read **once at startup**. If you edit it, restart
+> sync-watcher for the changes to take effect.
+
+### Known limitations
+
+sync-watcher implements a **pragmatic subset** of gitignore semantics via rsync's
+filter engine. Be aware of the following:
+
+- **Match-order semantics differ.** Git uses “last match wins”; rsync uses “first
+  match wins.” To make negation (`!`) behave intuitively, all `!` rules are
+  emitted **before** the excludes they override. Complex, deeply-nested negation
+  stacks may not translate perfectly.
+- **No per-subdirectory ignore cascade.** Only the single `~/.syncignore` file is
+  read; nested `.gitignore`/`.syncignore` files inside the tree are not honored.
+- **No global excludes file** (git's `core.excludesFile`) is consulted.
+- **`@<path>` pruning applies to directories that exist at startup.** A
+  root-anchored ignored directory created *after* startup is still excluded from
+  the transfer by rsync, but is not pruned from the watch tree until the next
+  restart.
+- **Edits require a restart** (the file is parsed once at startup).
 
 ---
 
@@ -295,6 +406,23 @@ $ touch /home/user/project/README.md      # triggers a sync
 # ...target/rogue.txt is removed; source is untouched.
 ```
 
+### Excluding files with `.syncignore`
+
+```console
+$ cat ~/.syncignore
+/node_modules
+/target
+*.log
+!important.log
+
+$ ./sync-watcher.sh
+... [INFO ] [sync-watcher] Loading ignore rules from /home/user/.syncignore
+... [INFO ] [sync-watcher] Ignore rules active: 3 exclude, 1 negation, 2 pruned dir(s).
+... [INFO ] [sync-watcher] Pruning 2 ignored director(y/ies) from the watch tree.
+... [INFO ] [sync-watcher] Synchronization completed successfully.
+# node_modules/, target/, and *.log files are skipped; important.log is kept.
+```
+
 ### Run as a background service (quick & dirty)
 
 ```bash
@@ -311,6 +439,7 @@ For a proper long-running service, see [Deployment](#deployment).
 <REPO>/
 ├── sync-watcher.sh        # The main (and only required) script
 ├── README.md              # This file
+├── .syncignore.example    # Optional: sample ignore rules to copy to ~/.syncignore
 ├── LICENSE                # License text (see License section)
 ├── tests/                 # Optional: test scripts  (placeholder)
 │   └── test_sync.sh
@@ -471,6 +600,8 @@ sudo loginctl enable-linger "$USER"
 | Target file re-appears after you delete it there               | Expected — sync is one-way; delete it in the **source** instead.                                            |
 | `SOURCE and TARGET resolve to the same directory`              | Point them at distinct directories; the tool refuses identical/nested paths to prevent data loss.           |
 | Prompt appears every run                                       | The configured path is invalid; enter a valid directory once and it will be saved.                          |
+| A file you expected to be ignored is still synced              | Check `~/.syncignore` syntax; remember it is read **once at startup** — restart after editing. Verify anchoring (`/name` = root only vs `name` = any depth). |
+| `important.log`-style negation not taking effect               | Ensure the `!` rule targets the same path the exclude matched; complex negation stacks are a known limitation. |
 | Nothing happens on a network share                             | Many NFS/SMB/FUSE mounts don't deliver inotify events reliably; sync-watcher needs local inotify support.    |
 
 Enable more verbose insight by watching the logs (they already print each sync start/finish and every error).
@@ -490,6 +621,15 @@ Yes — `rsync -a` (archive mode) preserves them.
 
 **Can I watch multiple source/target pairs?**
 Run multiple copies with different `PROCESS_NAME`/config values, or extend the script. Each instance has its own lock.
+
+**How do I exclude files from syncing?**
+Create a `~/.syncignore` file using gitignore-style patterns. See [Ignoring Files](#ignoring-files-syncignore). It is optional and fully backward compatible.
+
+**Are `.syncignore` changes picked up automatically?**
+No — the file is parsed once at startup. Restart sync-watcher after editing it.
+
+**Does it support `.gitignore`-style negation (`!`)?**
+Yes, with a caveat: because rsync uses “first match wins” (git uses “last match wins”), negation rules are emitted before their excludes. Simple cases like `*.log` + `!keep.log` work as expected; very complex negation stacks may not. See [Known limitations](#known-limitations).
 
 ---
 
